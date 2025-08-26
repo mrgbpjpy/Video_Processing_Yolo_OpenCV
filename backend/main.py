@@ -12,6 +12,10 @@ import cv2
 from ultralytics import YOLO
 # CORS middleware: https://fastapi.tiangolo.com/tutorial/cors/
 from fastapi.middleware.cors import CORSMiddleware
+# SQLAlchemy documentation: https://www.sqlalchemy.org/
+from sqlalchemy import create_engine, text
+# Datetime for timestamp: https://docs.python.org/3/library/datetime.html
+from datetime import datetime
 
 # FastAPI app instantiation: https://fastapi.tiangolo.com/tutorial/first-steps/
 app = FastAPI()
@@ -24,6 +28,26 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Database connection using environment variable
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL environment variable not set")
+engine = create_engine(DATABASE_URL)
+
+# Startup event to create table if not exists: https://fastapi.tiangolo.com/advanced/events/
+@app.on_event("startup")
+def startup():
+    with engine.connect() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS processing_logs (
+                id SERIAL PRIMARY KEY,
+                filename TEXT NOT NULL,
+                frame_count INTEGER NOT NULL,
+                timestamp TIMESTAMP NOT NULL
+            )
+        """))
+        conn.commit()
 
 # Load YOLO model: https://docs.ultralytics.com/reference/engine/model/#ultralytics.engine.model.YOLO.__init__
 model = YOLO("yolov8n.pt")  # Pre-trained YOLOv8 nano model
@@ -91,7 +115,6 @@ def upload_video(background_tasks: BackgroundTasks, file: UploadFile = File(...)
     fourcc = cv2.VideoWriter_fourcc(*'H264')
     # VideoWriter: https://docs.opencv.org/4.x/de/da9/classcv_1_1VideoWriter.html
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-
     # Check if writer opened: https://docs.opencv.org/4.x/de/da9/classcv_1_1VideoWriter.html#a0a48d6f52d38b2b1d333c7e7671ff05b
     if not out.isOpened():
         cap.release()
@@ -106,25 +129,30 @@ def upload_video(background_tasks: BackgroundTasks, file: UploadFile = File(...)
             ret, frame = cap.read()
             if not ret:
                 break
-
             # YOLO track: https://docs.ultralytics.com/reference/engine/results/#ultralytics.engine.results.Results.track
             results = model.track(frame, persist=True)
-
             # Plot annotations: https://docs.ultralytics.com/reference/engine/results/#ultralytics.engine.results.Results.plot
             annotated_frame = results[0].plot()
-
             # Write frame: https://docs.opencv.org/4.x/de/da9/classcv_1_1VideoWriter.html#a25c3df94779dcbd5c9744b399f2e1b32
             out.write(annotated_frame)
             frame_count += 1
 
         if frame_count == 0:
             raise Exception("No frames could be read from the input video - FFmpeg may not support this MP4's codec/profile")
-
         print(f"Processed and wrote {frame_count} frames successfully")
+
+        # Log to Postgres
+        with engine.connect() as conn:
+            conn.execute(
+                text("INSERT INTO processing_logs (filename, frame_count, timestamp) VALUES (:filename, :frame_count, :timestamp)"),
+                {"filename": file.filename, "frame_count": frame_count, "timestamp": datetime.now()}
+            )
+            conn.commit()
 
     except Exception as e:
         print(f"Error during video processing: {e}")
         raise HTTPException(status_code=500, detail=f"Error processing video: {str(e)}")
+
     finally:
         # Release resources
         cap.release()
@@ -134,6 +162,7 @@ def upload_video(background_tasks: BackgroundTasks, file: UploadFile = File(...)
 
     # Add background task: https://fastapi.tiangolo.com/tutorial/background-tasks/
     background_tasks.add_task(remove_file, output_path)
+
     # Return FileResponse: https://fastapi.tiangolo.com/advanced/custom-response/#fileresponse
     return FileResponse(
         output_path,
