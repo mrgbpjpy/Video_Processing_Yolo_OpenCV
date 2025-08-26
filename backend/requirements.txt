@@ -1,4 +1,6 @@
-fastapi==0.116.1
-uvicorn==0.33.0
-ultralytics
+fastapi
+uvicorn
 opencv-python-headless
+ultralytics
+sqlalchemy
+psycopg2-binary
